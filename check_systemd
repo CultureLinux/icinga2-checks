@@ -1,0 +1,75 @@
+#!/bin/bash
+
+################################################
+###  Check systemd services
+################################################
+
+STATUS_OK=0
+STATUS_WARN=1
+STATUS_CRITICAL=2
+
+count_ok=0
+count_warn=0
+count_critical=0
+
+msg=""
+
+while getopts "s:" opt; do
+    case $opt in
+        s) multi+=("$OPTARG")
+            ;;
+        h) echo " $0 -s ServiceName"
+            ;;
+    esac
+done
+shift $((OPTIND -1))
+
+
+for service in "${multi[@]}";
+do
+
+    test_started=`systemctl is-active $service` >/dev/null 2>&1
+    test_enabled=`systemctl is-enabled $service` >/dev/null 2>&1
+    bitmass=0
+
+    if [[ $test_started == 'inactive' ]]
+    then
+        ((bitmass+=2))
+    fi
+    if [[ $test_enabled == 'disabled' ]]
+    then
+        ((bitmass+=1))
+    fi
+
+    if [[ $bitmass -eq 3  ]]
+    then
+        echo "[$bitmass] !!! $service not active and disabled"
+        ((count_critical+=1))
+    fi
+    if [[ $bitmass -eq 2  ]]
+    then
+        echo "[$bitmass] !!! $service not active and enable"
+        ((count_critical+=1))
+    fi
+    if [[ $bitmass -eq 1  ]]
+    then
+        echo "[$bitmass] !!! $service active and disabled"
+        ((count_warning+=1))
+    fi
+    if [[ $bitmass -eq 0  ]]
+    then
+        echo "[$bitmass] !!! $service active and enable"
+        ((count_ok+=1))
+    fi
+done
+
+if [[ $count_critical -gt 0 ]]
+then
+    exit $STATUS_CRITICAL
+elif [[ $count_warning -gt 0 ]]
+then
+    exit $STATUS_WARN
+elif [[ $count_ok -gt 0 ]]
+then
+    exit $STATUS_OK
+fi
