@@ -1,0 +1,53 @@
+#!/bin/bash
+
+WARNING=5
+CRITICAL=10
+BIN_NAME="yum"
+
+while getopts "w:c:b:h:" option
+do
+        case $option in
+        w)
+                [[ $OPTARG != ?(-)+([[:digit:]]) ]] && echo "-w must be a number" && exit 1
+                WARNING=$OPTARG
+                ;;
+        c)
+                [[ $OPTARG != ?(-)+([[:digit:]]) ]] && echo "-c must be a number" && exit 1
+                CRITICAL=$OPTARG
+                ;;
+        b)
+                if [[ "$OPTARG" != "dnf" ]] && [[ "$OPTARG" != "yum" ]]
+                then
+                        echo "-b must be yum or dnf"
+                        exit 1
+                fi
+                BIN_NAME=$OPTARG
+                ;;                
+        h)
+                echo "Usage : -w WARNING -c CRITICAL -b [yum|dnf]"
+                echo "- h help"
+                ;;      
+        esac
+done
+
+PKG2UPDATE=`$BIN_NAME check-update | grep x86_64  | awk -F ' ' '{ print $1 }'  | tr '\r\n' ' '`
+PKG2UPDATENBR=`echo  ${PKG2UPDATE} | wc -w`
+
+perf="|'updates'=$PKG2UPDATENBR;$WARNING;$CRITICAL;;"
+
+if [[ $PKG2UPDATENBR -gt $CRITICAL ]]
+then
+        echo "$PKG2UPDATENBR $BIN_NAME packages to update $perf "
+        exit 2
+else
+        if [[ $PKG2UPDATENBR -gt $WARNING ]]
+        then
+                echo "$PKG2UPDATENBR $BIN_NAME packages to update $perf"
+                exit 1
+        else
+                echo " System fully updated $perf"
+                exit 0
+        fi
+fi
+
+exit 3
