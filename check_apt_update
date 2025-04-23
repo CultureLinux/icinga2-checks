@@ -1,0 +1,13 @@
+#!/bin/bash
+
+# Get the list of upgradable packages
+UPGRADABLE=$(apt list --upgradable 2>/dev/null | grep -v "Listing..." | wc -l)
+
+if [ "$UPGRADABLE" -eq 0 ]; then
+    echo "APT OK - No packages to upgrade"
+    exit 0
+else
+    PACKAGE_LIST=$(apt list --upgradable 2>/dev/null | grep -v "Listing..." | cut -d/ -f1)
+    echo "APT WARNING - $UPGRADABLE packages can be upgraded:\n$PACKAGE_LIST"
+    exit 1
+fi
