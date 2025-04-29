@@ -1,0 +1,30 @@
+#!/bin/bash
+
+WARNING=27
+CRITICAL=10
+
+if [[ $1 != '' && $2 != ''  ]]
+then
+  now_epoch=$( date +%s )
+  totest=`echo | openssl s_client -showcerts -servername $1 -connect "$1:$2" 2>/dev/null | openssl x509 -inform pem -noout -enddate | cut -d "=" -f 2 `
+  day_diff=$(( ($(date --date="$totest" +%s) - $now_epoch )/(60*60*24) ))
+  if [[ $day_diff -gt $WARNING ]]
+  then
+     echo "$day_diff jours restant pour $1:$2"
+     exit 0
+  elif [[  $day_diff -gt $CRITICAL ]]
+  then
+    echo "$day_diff jours restant pour $1:$2"
+    exit 1
+  elif [[  $day_diff -le $CRITICAL ]]
+  then
+    echo "$day_diff jours restant pour $1:$2"
+    exit 2
+  else 
+    echo "Erreur pour $1:$2"
+    exit 3
+  fi
+else
+  echo 'usage ./check_openssl_certificate.sh <hostname> <port>'
+  exit 3
+fi
