@@ -24,3 +24,12 @@
         "-s" = { value = "$array_pass$"}
         }
     }
+
+## check_openssl_certificate
+### hosts
+    object Host "YOUR_HOSTNAME" {
+        import "generic-host"
+        ...
+        vars.openssl_certificates = [ "/etc/ssl/certs/YOUR_CERTIFICATE.pem"]
+    }
+### service & command 
