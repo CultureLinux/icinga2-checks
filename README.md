@@ -27,9 +27,28 @@
 
 ## check_openssl_certificate
 ### hosts
-    object Host "YOUR_HOSTNAME" {
+    object Host "HTTPS-hosts" {
         import "generic-host"
-        ...
-        vars.openssl_certificates = [ "/etc/ssl/certs/YOUR_CERTIFICATE.pem"]
+        address = "127.0.0.1"
+
+        vars.local.vhosts.ssl["icinga.local.clinux.fr"] = { port = 443 }
+        vars.local.vhosts.ssl["proxmox.local.clinux.fr"] = { port = 8006 }
     }
 ### service & command 
+    apply Service "Certificat " for (vhost => config in host.vars.local.vhosts.ssl) {
+    import "generic-service"
+    check_command = "check_openssl_certificate"
+
+    vars.ssl_port = config.port
+    vars.vhost_name = vhost
+
+    assign where host.vars.local.vhosts.ssl
+    }
+
+    object CheckCommand "check_openssl_certificate" {
+    import "plugin-check-command"
+    command = [ PluginDir + "/check_openssl_certificate",
+        "$vhost_name$",
+        "$ssl_port$"
+    ]
+    }
