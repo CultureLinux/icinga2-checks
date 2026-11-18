@@ -136,11 +136,14 @@ object CheckCommand "check_apt_update" {
 
 ## check_gitlab_update
 
-Checks for updates to the installed `gitlab-ce` or `gitlab-ee` package.
+Checks for updates only for the detected GitLab edition and shows the installed
+version, for example `GITLAB OK - gitlab-ce 19.5.6 is up to date`.
 It selects APT on Debian-based hosts and DNF on Red Hat-based or Fedora hosts
 using `/etc/os-release`. APT reads its existing package indexes, so keep them
 current through the host's normal refresh schedule. DNF uses its configured
-repositories and metadata policy. Run the check where GitLab is installed.
+repositories and metadata policy. The check runs DNF with `-y` to approve
+imports of configured repository keys when prompted. Run the check where
+GitLab is installed.
 
 The plugin returns OK (0) when GitLab is installed and no update is found,
 and CRITICAL (2) when an update is available. It returns UNKNOWN (3) when
