@@ -237,18 +237,22 @@ Engine and the relevant registries under the account running the check. It
 reads image metadata in place. Services with a build configuration or without
 an active container are skipped.
 
-The default output shows running containers and lists available updates first,
-marked with `!`. Pass `--full` for the full inventory, image digests and cache
-statistics.
+The default output shows running containers. Confirmed updates (`!`) appear
+first, followed by images using `latest` without a confirmed update (`?`) and
+then the remaining results. An image without a tag or digest implicitly uses
+`latest`. Both markers trigger WARNING. Pass `--full` for the full inventory,
+image digests and cache statistics.
 
 ```bash
 ./check_compose_update --root /home/docky/docker-prod \
-  --cache-file /var/cache/icinga2/compose-update.sqlite3 --cache-ttl 3600
+  --cache-file "/tmp/compose-update-$UID/registry.sqlite3" --cache-ttl 3600
 ```
 
-Create the cache's parent directory beforehand and make it writable by the
-account running the check. The SQLite cache stores successful registry digests
-per image reference and platform for one hour by default. Local container
+The check creates the cache directory and SQLite database when needed,
+including in the default short output mode. Use a separate directory for each
+account that runs the check. If the system clears `/tmp`, the next check
+rebuilds the cache. The cache stores successful registry digests per image
+reference and platform for one hour by default. Local container
 images are inspected on every run. An expired entry must be refreshed before
 it can be used again. Omit `--cache-file` or set `--cache-ttl 0` to disable
 persistent caching. Use `--debug` for Docker diagnostics and
@@ -259,24 +263,61 @@ persistent caching. Use `--debug` for Docker diagnostics and
 **1. Prepare the Docker host**
 
 From a checkout on the Docker host, copy the plugin into the agent's
-`PluginDir` and prepare its cache directory. The example uses `icinga` and
+`PluginDir`. The example uses `icinga` and
 `/usr/lib64/nagios/plugins`. Substitute the account and directory configured
 on your agent.
 
 ```bash
 check_user=icinga
 plugin_dir=/usr/lib64/nagios/plugins
-cache_dir=/var/cache/icinga2/compose-update
+cache_dir=/tmp/icinga2-compose-update
 
 sudo install -m 0755 check_compose_update "$plugin_dir/check_compose_update"
-sudo install -d -m 0750 -o "$check_user" "$cache_dir"
 ```
 
 The check account needs to traverse the scan root, read the Compose files and
 their `.env` files, access Docker as configured for the agent, and write to
 the cache directory. Configure any required registry credentials for that same
-account. On a rootful Docker host, membership in the `docker` group grants
-root-level privileges. [Docker Engine access](https://docs.docker.com/engine/install/linux-postinstall/#manage-docker-as-a-non-root-user)
+account.
+
+If the agent uses the standard rootful Docker socket owned by the `docker`
+group, add the check account to that group. Membership grants root-level
+privileges. [Docker Engine access](https://docs.docker.com/engine/install/linux-postinstall/#manage-docker-as-a-non-root-user)
+
+```bash
+sudo usermod -aG docker "$check_user"
+```
+
+If the scan root is under a private home directory, inspect the permissions on
+each path component with `namei -l /home/docky/docker-prod`. Choose one of the
+following options to let the check account traverse `/home/docky`.
+
+**Option A — ACL for the check account.** On a filesystem with ACL support,
+grant the check account traversal through `/home/docky`:
+
+```bash
+sudo setfacl -m "u:${check_user}:--x" /home/docky
+```
+
+**Option B — Use the `docky` group.** Add the check account to the group,
+and grant the group traversal through `/home/docky`. The account also gains access
+to other files and directories already shared with the `docky` group.
+
+```bash
+sudo usermod -aG docky "$check_user"
+sudo chmod g+x /home/docky
+```
+
+With either option, the account still needs read and traverse access to the
+directories it scans and read access to the Compose files and their inputs.
+
+After changing group memberships, restart Icinga on the Docker host so the
+agent picks them up. Verify Docker access as the check account.
+
+```bash
+sudo systemctl restart icinga2
+sudo -u "$check_user" docker info
+```
 
 **2. Define the check and service**
 
@@ -320,19 +361,20 @@ The two paths are local to the agent.
 ```icinga2
 vars.client_endpoint = "docker.example.org"
 vars.compose_update_root = "/home/docky/docker-prod"
-vars.compose_update_cache_file = "/var/cache/icinga2/compose-update/registry.sqlite3"
+vars.compose_update_cache_file = "/tmp/icinga2-compose-update/registry.sqlite3"
 ```
 
 **3. Validate the integration**
 
-On the Docker host, run the installed plugin twice as the check account. The
-second run should report cache hits for successful registry lookups from the
-first run. The Icinga service uses the shorter output by default.
+On the Docker host, run the installed plugin as the check account. The first
+run initializes the cache when it is enabled. To inspect cache hit counts,
+repeat the command with `--full`. The Icinga service uses the short output
+by default.
 
 ```bash
 sudo -u "$check_user" -- "$plugin_dir/check_compose_update" \
   --root /home/docky/docker-prod \
-  --cache-file "$cache_dir/registry.sqlite3" --full
+  --cache-file "$cache_dir/registry.sqlite3"
 ```
 
 Validate the Icinga configuration before reloading it on the scheduler.

@@ -265,8 +265,13 @@ def main() -> int:
         print("UNKNOWN - Exclusions must be subdirectory paths relative to --root")
         return STATUS_UNKNOWN
     exclusions = set(args.exclude)
-    if not root.is_dir():
-        print(f"UNKNOWN - Scan root is not an accessible directory: {root}")
+    try:
+        is_directory = root.is_dir()
+    except OSError as error:
+        print(f"UNKNOWN - Cannot access scan root {root}: {error.strerror}")
+        return STATUS_UNKNOWN
+    if not is_directory:
+        print(f"UNKNOWN - Scan root is not a directory: {root}")
         return STATUS_UNKNOWN
 
     docker = shutil.which("docker")
@@ -275,22 +280,25 @@ def main() -> int:
         return STATUS_UNKNOWN
     docker = os.path.abspath(docker)
 
-    details: List[str] = []
+    details: Dict[str, List[str]] = {"! ": [], "? ": [], "": []}
     update_lines: List[str] = []
+    latest_lines: List[str] = []
     running_lines: List[str] = []
     errors: List[str] = []
     cache = None
     if args.cache_file and args.cache_ttl:
+        cache_file = args.cache_file.expanduser()
         try:
-            cache = sqlite3.connect(str(args.cache_file.expanduser()), timeout=1)
+            cache_file.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+            cache = sqlite3.connect(str(cache_file), timeout=1)
             with cache:
                 cache.execute(
                     "CREATE TABLE IF NOT EXISTS registry_image_digests ("
                     "reference TEXT, platform TEXT, manifest TEXT, config TEXT, checked_at REAL, "
                     "PRIMARY KEY (reference, platform))"
                 )
-        except sqlite3.Error as error:
-            errors.append(f"Cannot open registry cache: {error}")
+        except (OSError, sqlite3.Error) as error:
+            errors.append(f"Cannot open registry cache {cache_file}: {error}")
             if cache is not None:
                 cache.close()
                 cache = None
@@ -305,6 +313,7 @@ def main() -> int:
     declarations = 0
     compared = 0
     updates = 0
+    latest = 0
     persistent_hits = 0
 
     @lru_cache(maxsize=None)
@@ -382,6 +391,10 @@ def main() -> int:
             declarations += sum(service.image is not None for service in services)
             project_directory = compose_file.parent.resolve()
             for service in services:
+                marker = ""
+                reference = service.image or ""
+                image_name = reference.rsplit("/", 1)[-1]
+                uses_latest = "@" not in reference and image_name.partition(":")[2] in ("", "latest")
                 if containers is None:
                     description = f"{service.image or 'local build'} - runtime unknown"
                 else:
@@ -420,20 +433,27 @@ def main() -> int:
                                 remote = digests.manifest if container.manifest is not None else digests.config
                             except (OSError, ValueError) as error:
                                 errors.append(f"{relative}: {service.name}/{container.name}: {error}")
-                                if container.state == "running":
+                                if container.state == "running" and not uses_latest:
                                     running_lines.append(f"{label} comparison unknown")
-                                continue
-                            compared += 1
-                            if remote == local_digest:
-                                description += f" - {container.name}: up to date"
-                                if container.state == "running":
-                                    running_lines.append(f"{label} up to date")
                             else:
-                                updates += 1
-                                description += f" - {container.name}: update available [{remote}]"
+                                compared += 1
+                                if remote != local_digest:
+                                    updates += 1
+                                    marker = "! "
+                                    description += f" - {container.name}: update available [{remote}]"
+                                    if container.state == "running":
+                                        update_lines.append(f"! {label} update available")
+                                    continue
+                                description += f" - {container.name}: up to date"
+                                if container.state == "running" and not uses_latest:
+                                    running_lines.append(f"{label} up to date")
+                            if uses_latest:
+                                latest += 1
+                                marker = marker or "? "
+                                description += f" - {container.name}: uses latest tag"
                                 if container.state == "running":
-                                    update_lines.append(f"! {label} update available")
-                details.append(f"{relative}: {service.name} -> {description}")
+                                    latest_lines.append(f"? {label} uses latest tag")
+                details[marker].append(f"{marker}{relative}: {service.name} -> {description}")
 
     if not found:
         errors.append(f"No Compose files found under {root}")
@@ -443,25 +463,28 @@ def main() -> int:
     if cache is not None:
         cache.close()
 
-    if updates:
+    if updates or latest:
         status, exit_code = "WARNING", STATUS_WARNING
     elif errors:
         status, exit_code = "UNKNOWN", STATUS_UNKNOWN
     else:
         status, exit_code = "OK", STATUS_OK
     summary = f"{status} - {updates} update(s), {compared} container(s) compared"
+    if latest:
+        summary += f", {latest} container(s) using latest without a confirmed update"
     if args.full:
         summary += f", {declarations} image declaration(s), {resolved}/{found} Compose file(s) resolved"
         if args.cache_file and args.cache_ttl:
             summary += f", {persistent_hits} registry cache hit(s)"
     print(summary)
-    if not args.full:
-        for line in update_lines:
+    flagged_groups = (details["! "], details["? "]) if args.full else (update_lines, latest_lines)
+    for group in flagged_groups:
+        for line in group:
             print(line)
     for error in errors:
         print(f"UNKNOWN - {error}")
-    for detail in details if args.full else running_lines:
-        print(detail)
+    for line in details[""] if args.full else running_lines:
+        print(line)
     return exit_code
 
 
