@@ -10,6 +10,7 @@ memory usage from Icinga 2 or the command line.
 | [`check_systemd`](#check_systemd) | Running and enablement states of one or more systemd units. |
 | [`check_openssl_certificate`](#check_openssl_certificate) | Days until the certificate presented by a TLS endpoint expires. |
 | [`check_apt_update`](#check_apt_update) | Pending package upgrades on APT-based hosts. |
+| [`check_gitlab_update`](#check_gitlab_update) | Available GitLab CE or EE package updates via APT or DNF. |
 | [`check_update`](#check_update) | Pending package upgrades via YUM or DNF, with configurable thresholds. |
 | [`check_mem.pl`](#check_mempl-and-check_mempy) | Free or used memory, with Nagios performance data. |
 | [`check_mem.py`](#check_mempl-and-check_mempy) | Free or used memory on Linux, using `/proc/meminfo`. |
@@ -130,6 +131,30 @@ no arguments and returns WARNING when at least one upgrade is available.
 object CheckCommand "check_apt_update" {
     import "plugin-check-command"
     command = [ PluginDir + "/check_apt_update" ]
+}
+```
+
+## check_gitlab_update
+
+Checks for updates to the installed `gitlab-ce` or `gitlab-ee` package.
+It selects APT on Debian-based hosts and DNF on Red Hat-based or Fedora hosts
+using `/etc/os-release`. APT reads its existing package indexes, so keep them
+current through the host's normal refresh schedule. DNF uses its configured
+repositories and metadata policy. Run the check where GitLab is installed.
+
+The plugin returns OK (0) when GitLab is installed and no update is found,
+and CRITICAL (2) when an update is available. It returns UNKNOWN (3) when
+neither edition is installed, the distribution is unsupported, or the
+package manager is unavailable or the update query fails.
+
+```bash
+./check_gitlab_update
+```
+
+```icinga2
+object CheckCommand "check_gitlab_update" {
+    import "plugin-check-command"
+    command = [ PluginDir + "/check_gitlab_update" ]
 }
 ```
 
