@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""Compare running Docker Compose images with their declared registry references."""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import sqlite3
+import subprocess
+from collections import defaultdict
+from functools import lru_cache
+from pathlib import Path
+from time import monotonic, time
+from typing import Dict, List, NamedTuple, Optional, Tuple
+
+
+COMPOSE_FILENAMES = (
+    "compose.yaml",
+    "compose.yml",
+    "docker-compose.yaml",
+    "docker-compose.yml",
+)
+STATUS_OK = 0
+STATUS_WARNING = 1
+STATUS_UNKNOWN = 3
+
+
+class Service(NamedTuple):
+    name: str
+    image: Optional[str]
+    build: bool
+
+
+class Container(NamedTuple):
+    name: str
+    state: str
+    reference: str
+    image_id: str
+    working_directory: str
+    manifest: Optional[dict]
+
+
+class Platform(NamedTuple):
+    os: str
+    architecture: str
+    variant: str
+
+
+class RegistryDigests(NamedTuple):
+    manifest: str
+    config: str
+
+
+def compose_images(docker: str, compose_file: Path, debug: bool) -> Tuple[str, List[Service]]:
+    """Resolve one Compose project and return its declared services."""
+    command = [docker, "compose", "--profile", "*"]
+    env_file = compose_file.parent / ".env"
+    if env_file.is_file():
+        command.extend(["--env-file", env_file.name])
+    command.extend(["-f", compose_file.name])
+    for suffix in (".yaml", ".yml"):
+        override = compose_file.with_name(f"{compose_file.stem}.override{suffix}")
+        if override.exists():
+            command.extend(["-f", override.name])
+            break
+
+    # The inventory only needs service definitions, even if the stack cannot start.
+    command.extend(["config", "--no-consistency"])
+    try:
+        result = subprocess.run(
+            [*command, "--format", "json"],
+            cwd=compose_file.parent,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=None if debug else subprocess.DEVNULL,
+            encoding="utf-8",
+            check=True,
+            timeout=15,
+        )
+    except subprocess.CalledProcessError as error:
+        diagnostic = " ".join(shlex.quote(part) for part in [*command, "--quiet"])
+        raise ValueError(
+            f"Docker Compose config failed (exit {error.returncode}). "
+            f"To diagnose locally: cd {shlex.quote(str(compose_file.parent))} && {diagnostic}"
+        ) from error
+    config = json.loads(result.stdout)
+    if not isinstance(config, dict) or not isinstance(config.get("services"), dict):
+        raise ValueError("Compose output does not contain a services mapping")
+
+    project = config.get("name")
+    if not isinstance(project, str) or not project:
+        raise ValueError("Compose output does not contain a project name")
+
+    services = []
+    for name, service in sorted(config["services"].items()):
+        if not isinstance(service, dict):
+            raise ValueError("invalid service in Compose output")
+        image = service.get("image")
+        build = "build" in service and service["build"] is not None
+        if isinstance(image, str) and image.strip():
+            services.append(Service(name, image, build))
+        elif image is None and build:
+            services.append(Service(name, None, True))
+        else:
+            raise ValueError(f"{name}: service has no usable image or build configuration")
+    return project, services
+
+
+def docker_output(docker: str, arguments: List[str], debug: bool, timeout: float = 15) -> str:
+    """Read Docker metadata without exposing unrelated container configuration."""
+    command_name = " ".join(arguments[:3] if arguments[0] == "buildx" else arguments[:2])
+    try:
+        return subprocess.run(
+            [docker, *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=None if debug else subprocess.DEVNULL,
+            check=True,
+            timeout=timeout,
+        ).stdout.decode("utf-8")
+    except subprocess.CalledProcessError as error:
+        raise ValueError(f"docker {command_name} failed (exit {error.returncode})") from error
+    except subprocess.TimeoutExpired as error:
+        raise ValueError(f"docker {command_name} timed out after {timeout:g} seconds") from error
+
+
+def inspect_containers(docker: str, debug: bool) -> Dict[Tuple[str, str], List[Container]]:
+    """Index Compose service containers by project and service labels."""
+    ids = docker_output(
+        docker, ["ps", "--all", "--quiet", "--no-trunc", "--filter", "label=com.docker.compose.project"], debug
+    ).split()
+    containers: Dict[Tuple[str, str], List[Container]] = defaultdict(list)
+
+    for offset in range(0, len(ids), 100):
+        output = docker_output(
+            docker, ["container", "inspect", *ids[offset:offset + 100]], debug
+        )
+        for entry in json.loads(output):
+            config = entry["Config"]
+            labels = config.get("Labels") or {}
+            project = labels.get("com.docker.compose.project")
+            service = labels.get("com.docker.compose.service")
+            if project and service and labels.get("com.docker.compose.oneoff", "").lower() != "true":
+                containers[project, service].append(
+                    Container(
+                        entry["Name"].lstrip("/"), entry["State"]["Status"], config["Image"],
+                        entry["Image"], labels.get("com.docker.compose.project.working_dir", ""),
+                        entry.get("ImageManifestDescriptor"),
+                    )
+                )
+    return containers
+
+
+def describe_service(service: Service, containers: List[Container]) -> str:
+    """Describe each active replica and flag divergent image IDs."""
+    description = service.image or "local build (no image declared)"
+    if service.image and service.build:
+        description += " (build configured)"
+    active = [container for container in containers if container.state in ("running", "paused")]
+    if not active:
+        states = ", ".join(sorted({container.state for container in containers}))
+        return f"{description} - no running container ({states or 'none found'})"
+
+    replicas = "; ".join(
+        f"{container.name}: {container.reference} [{container.image_id}] ({container.state})"
+        for container in sorted(active)
+    )
+    mixed = len({container.image_id for container in active}) > 1
+    return f"{description} - {replicas}" + (" (mixed image IDs)" if mixed else "")
+
+
+def image_platform(image: dict) -> Platform:
+    """Read the platform from an image config or a manifest descriptor."""
+    os_name = image.get("os") or image.get("Os")
+    architecture = image.get("architecture") or image.get("Architecture")
+    variant = image.get("variant") or image.get("Variant") or ""
+    if not isinstance(os_name, str) or not isinstance(architecture, str) or not isinstance(variant, str):
+        raise ValueError("image platform is missing or invalid")
+    if (architecture, variant) in {("arm64", "v8"), ("amd64", "v1")}:
+        variant = ""
+    return Platform(os_name, architecture, variant)
+
+
+def sha256_digest(value: object) -> str:
+    """Return a valid image or manifest digest."""
+    if not isinstance(value, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+        raise ValueError("invalid or unsupported image digest")
+    return value
+
+
+def registry_digests(
+    docker: str, reference: str, platform: Platform, debug: bool, deadline: float
+) -> RegistryDigests:
+    """Resolve the registry manifest and image configuration for the local platform."""
+    inspect = ["buildx", "imagetools", "inspect"]
+    def registry_output(arguments: List[str]) -> str:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise ValueError("registry lookup time budget exhausted")
+        return docker_output(docker, [*inspect, *arguments], debug, timeout=min(15, remaining))
+
+    raw = registry_output(["--raw", "--", reference])
+    manifest = json.loads(raw)
+    if not isinstance(manifest, dict):
+        raise ValueError("unexpected registry manifest")
+
+    repository = reference.split("@", 1)[0]
+    if repository.rfind(":") > repository.rfind("/"):
+        repository = repository.rsplit(":", 1)[0]
+
+    if "manifests" in manifest:
+        descriptors = manifest["manifests"]
+        if not isinstance(descriptors, list):
+            raise ValueError("invalid registry manifest index")
+        candidates = set()
+        for descriptor in descriptors:
+            if not isinstance(descriptor, dict) or not isinstance(descriptor.get("platform"), dict):
+                continue
+            target = image_platform(descriptor["platform"])
+            if target == platform:
+                candidates.add(sha256_digest(descriptor.get("digest")))
+        if len(candidates) != 1:
+            raise ValueError(f"expected one registry manifest for {'/'.join(filter(None, platform))}")
+        manifest_digest = next(iter(candidates))
+        child = f"{repository}@{manifest_digest}"
+        manifest = json.loads(registry_output(["--raw", "--", child]))
+    else:
+        # Pin the platform lookup to the exact manifest returned above.
+        manifest_digest = "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        pinned = f"{repository}@{manifest_digest}"
+        image = json.loads(registry_output(["--format", "{{json .Image}}", "--", pinned]))
+        if not isinstance(image, dict) or image_platform(image) != platform:
+            raise ValueError(f"registry image platform differs from {'/'.join(filter(None, platform))}")
+
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("config"), dict):
+        raise ValueError("registry manifest has no image configuration")
+    return RegistryDigests(manifest_digest, sha256_digest(manifest["config"].get("digest")))
+
+
+def main() -> int:
+    """Print a Nagios summary followed by inventory details."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", required=True, type=Path, help="directory to scan recursively")
+    parser.add_argument(
+        "--exclude", action="append", type=Path, default=[], metavar="PATH",
+        help="skip a directory relative to --root (repeatable)",
+    )
+    parser.add_argument("--debug", action="store_true", help="show Docker Compose diagnostics on stderr")
+    parser.add_argument("--full", action="store_true", help="show the complete Compose and container inventory")
+    parser.add_argument("--cache-file", type=Path, help="persistent SQLite cache for registry digests")
+    parser.add_argument("--cache-ttl", type=int, default=3600, metavar="SECONDS",
+                        help="registry cache lifetime, 0 disables it (default: 3600)")
+    parser.add_argument("--registry-budget", type=int, default=90, metavar="SECONDS",
+                        help="time budget from the first uncached registry lookup (default: 90)")
+    args = parser.parse_args()
+
+    root = args.root.expanduser().absolute()
+    if args.cache_ttl < 0 or args.registry_budget <= 0:
+        print("UNKNOWN - Cache TTL must be nonnegative and registry budget must be positive")
+        return STATUS_UNKNOWN
+    if any(path.is_absolute() or path == Path(".") or ".." in path.parts for path in args.exclude):
+        print("UNKNOWN - Exclusions must be subdirectory paths relative to --root")
+        return STATUS_UNKNOWN
+    exclusions = set(args.exclude)
+    if not root.is_dir():
+        print(f"UNKNOWN - Scan root is not an accessible directory: {root}")
+        return STATUS_UNKNOWN
+
+    docker = shutil.which("docker")
+    if docker is None:
+        print("UNKNOWN - Docker CLI not found in PATH")
+        return STATUS_UNKNOWN
+    docker = os.path.abspath(docker)
+
+    details: List[str] = []
+    update_lines: List[str] = []
+    running_lines: List[str] = []
+    errors: List[str] = []
+    cache = None
+    if args.cache_file and args.cache_ttl:
+        try:
+            cache = sqlite3.connect(str(args.cache_file.expanduser()), timeout=1)
+            with cache:
+                cache.execute(
+                    "CREATE TABLE IF NOT EXISTS registry_image_digests ("
+                    "reference TEXT, platform TEXT, manifest TEXT, config TEXT, checked_at REAL, "
+                    "PRIMARY KEY (reference, platform))"
+                )
+        except sqlite3.Error as error:
+            errors.append(f"Cannot open registry cache: {error}")
+            if cache is not None:
+                cache.close()
+                cache = None
+    registry_deadline: Optional[float] = None
+    try:
+        containers = inspect_containers(docker, args.debug)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        containers = None
+        errors.append(f"Cannot inspect Docker containers: {error}")
+    found = 0
+    resolved = 0
+    declarations = 0
+    compared = 0
+    updates = 0
+    persistent_hits = 0
+
+    @lru_cache(maxsize=None)
+    def legacy_platform(image_id: str) -> Platform:
+        output = docker_output(docker, ["image", "inspect", "--format", "{{json .}}", image_id], args.debug)
+        image = json.loads(output)
+        if not isinstance(image, dict):
+            raise ValueError("unexpected local image metadata")
+        if image.get("Descriptor"):
+            raise ValueError("container image manifest descriptor unavailable")
+        return image_platform(image)
+
+    @lru_cache(maxsize=None)
+    def remote_digest(reference: str, platform: Platform) -> Tuple[Optional[RegistryDigests], str]:
+        nonlocal registry_deadline, persistent_hits
+        key = (reference, "/".join(platform))
+        if cache is not None:
+            try:
+                hit = cache.execute(
+                    "SELECT manifest, config FROM registry_image_digests WHERE reference = ? AND platform = ? "
+                    "AND checked_at > ? AND checked_at <= ?",
+                    (*key, time() - args.cache_ttl, time()),
+                ).fetchone()
+                if hit is not None:
+                    digest = RegistryDigests(sha256_digest(hit[0]), sha256_digest(hit[1]))
+                    persistent_hits += 1
+                    return digest, ""
+            except (sqlite3.Error, ValueError) as error:
+                errors.append(f"Cannot read registry cache: {error}")
+
+        if registry_deadline is None:
+            registry_deadline = monotonic() + args.registry_budget
+        try:
+            digest = registry_digests(docker, reference, platform, args.debug, registry_deadline)
+        except (OSError, ValueError) as error:
+            return None, str(error)
+
+        if cache is not None:
+            try:
+                with cache:
+                    cache.execute(
+                        "INSERT OR REPLACE INTO registry_image_digests VALUES (?, ?, ?, ?, ?)",
+                        (*key, *digest, time()),
+                    )
+            except sqlite3.Error as error:
+                errors.append(f"Cannot write registry cache: {error}")
+        return digest, ""
+
+    def record_scan_error(error: OSError) -> None:
+        errors.append(f"Cannot scan {error.filename}: {error.strerror}")
+
+    for directory, subdirectories, filenames in os.walk(root, onerror=record_scan_error):
+        compose_files = [name for name in COMPOSE_FILENAMES if name in filenames]
+        relative_directory = Path(directory).relative_to(root)
+        if compose_files:
+            subdirectories.clear()
+        else:
+            subdirectories[:] = sorted(
+                name for name in subdirectories if relative_directory / name not in exclusions
+            )
+
+        for filename in compose_files:
+            found += 1
+            compose_file = Path(directory) / filename
+            relative = compose_file.relative_to(root)
+            try:
+                project, services = compose_images(docker, compose_file, args.debug)
+            except subprocess.TimeoutExpired:
+                errors.append(f"{relative}: Docker Compose config timed out after 15 seconds")
+                continue
+            except (OSError, ValueError) as error:
+                errors.append(f"{relative}: {error}")
+                continue
+            resolved += 1
+            declarations += sum(service.image is not None for service in services)
+            project_directory = compose_file.parent.resolve()
+            for service in services:
+                if containers is None:
+                    description = f"{service.image or 'local build'} - runtime unknown"
+                else:
+                    project_containers = [
+                        container for container in containers.get((project, service.name), [])
+                        if not container.working_directory
+                        or Path(container.working_directory).resolve() == project_directory
+                    ]
+                    description = describe_service(service, project_containers)
+                    running_count = sum(container.state == "running" for container in project_containers)
+                    if service.build or service.image is None:
+                        description += " - registry comparison skipped (build configured)"
+                    for container in sorted(project_containers):
+                        if container.state not in ("running", "paused"):
+                            continue
+                        label = f"{relative}: {service.name}"
+                        if running_count > 1:
+                            label += f" ({container.name})"
+                        if service.build or service.image is None:
+                            if container.state == "running":
+                                running_lines.append(f"{label} comparison skipped (build configured)")
+                        else:
+                            try:
+                                if container.manifest is not None:
+                                    local_digest = sha256_digest(container.manifest.get("digest"))
+                                    platform_data = container.manifest.get("platform")
+                                    if not isinstance(platform_data, dict):
+                                        raise ValueError("container image manifest has no platform")
+                                    platform = image_platform(platform_data)
+                                else:
+                                    local_digest = sha256_digest(container.image_id)
+                                    platform = legacy_platform(local_digest)
+                                digests, error_message = remote_digest(service.image, platform)
+                                if digests is None:
+                                    raise ValueError(error_message)
+                                remote = digests.manifest if container.manifest is not None else digests.config
+                            except (OSError, ValueError) as error:
+                                errors.append(f"{relative}: {service.name}/{container.name}: {error}")
+                                if container.state == "running":
+                                    running_lines.append(f"{label} comparison unknown")
+                                continue
+                            compared += 1
+                            if remote == local_digest:
+                                description += f" - {container.name}: up to date"
+                                if container.state == "running":
+                                    running_lines.append(f"{label} up to date")
+                            else:
+                                updates += 1
+                                description += f" - {container.name}: update available [{remote}]"
+                                if container.state == "running":
+                                    update_lines.append(f"! {label} update available")
+                details.append(f"{relative}: {service.name} -> {description}")
+
+    if not found:
+        errors.append(f"No Compose files found under {root}")
+
+    if found and not compared and not errors:
+        errors.append("No active registry-backed containers could be compared")
+    if cache is not None:
+        cache.close()
+
+    if updates:
+        status, exit_code = "WARNING", STATUS_WARNING
+    elif errors:
+        status, exit_code = "UNKNOWN", STATUS_UNKNOWN
+    else:
+        status, exit_code = "OK", STATUS_OK
+    summary = f"{status} - {updates} update(s), {compared} container(s) compared"
+    if args.full:
+        summary += f", {declarations} image declaration(s), {resolved}/{found} Compose file(s) resolved"
+        if args.cache_file and args.cache_ttl:
+            summary += f", {persistent_hits} registry cache hit(s)"
+    print(summary)
+    if not args.full:
+        for line in update_lines:
+            print(line)
+    for error in errors:
+        print(f"UNKNOWN - {error}")
+    for detail in details if args.full else running_lines:
+        print(detail)
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
