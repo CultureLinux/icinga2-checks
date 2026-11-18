@@ -1,0 +1,71 @@
+#!/bin/bash
+
+set -u
+export LC_ALL=C
+
+if [[ ! -r /etc/os-release ]]; then
+    printf 'GITLAB UNKNOWN - Unable to read /etc/os-release\n'
+    exit 3
+fi
+
+unset ID ID_LIKE
+# shellcheck source=/dev/null
+. /etc/os-release
+
+packages=(gitlab-ce gitlab-ee)
+
+case " ${ID:-} ${ID_LIKE:-} " in
+    *" debian "*|*" ubuntu "*)
+        if ! command -v apt >/dev/null || ! command -v dpkg-query >/dev/null; then
+            printf 'GITLAB UNKNOWN - APT or dpkg-query is unavailable\n'
+            exit 3
+        fi
+        # dpkg-query can return a partial result when only one edition is known.
+        installed_status=$(dpkg-query -W -f='${db:Status-Status}\n' "${packages[@]}" 2>/dev/null) || true
+        if [[ $'\n'"$installed_status"$'\n' != *$'\ninstalled\n'* ]]; then
+            printf 'GITLAB UNKNOWN - No GitLab CE or EE package found installed\n'
+            exit 3
+        fi
+        if ! apt_output=$(apt list --upgradable "${packages[@]}" 2>/dev/null); then
+            printf 'GITLAB UNKNOWN - Unable to list APT upgrades\n'
+            exit 3
+        fi
+        while IFS='/ ' read -r package _ version _; do
+            case "$package" in
+                gitlab-ce|gitlab-ee)
+                    printf 'GITLAB CRITICAL - Update available for %s (%s)\n' "$package" "$version"
+                    exit 2
+                    ;;
+            esac
+        done <<< "$apt_output"
+        ;;
+    *" rhel "*|*" fedora "*|*" centos "*)
+        if ! command -v dnf >/dev/null || ! command -v rpm >/dev/null; then
+            printf 'GITLAB UNKNOWN - DNF or RPM is unavailable\n'
+            exit 3
+        fi
+        if ! rpm -q gitlab-ce >/dev/null 2>&1 && ! rpm -q gitlab-ee >/dev/null 2>&1; then
+            printf 'GITLAB UNKNOWN - No GitLab CE or EE package found installed\n'
+            exit 3
+        fi
+        dnf_status=0
+        dnf check-upgrade "${packages[@]}" >/dev/null 2>&1 || dnf_status=$?
+        case "$dnf_status" in
+            0) ;;
+            100)
+                printf 'GITLAB CRITICAL - DNF reports a GitLab CE or EE update\n'
+                exit 2
+                ;;
+            *)
+                printf 'GITLAB UNKNOWN - DNF check-upgrade failed (exit %s)\n' "$dnf_status"
+                exit 3
+                ;;
+        esac
+        ;;
+    *)
+        printf 'GITLAB UNKNOWN - Unsupported distribution (%s)\n' "${ID:-unknown}"
+        exit 3
+        ;;
+esac
+
+printf 'GITLAB OK - No GitLab CE or EE update found\n'
