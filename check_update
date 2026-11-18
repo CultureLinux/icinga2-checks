@@ -4,50 +4,82 @@ WARNING=5
 CRITICAL=10
 BIN_NAME="yum"
 
-while getopts "w:c:b:h:" option
+while getopts ":w:c:b:h" option
 do
         case $option in
         w)
-                [[ $OPTARG != ?(-)+([[:digit:]]) ]] && echo "-w must be a number" && exit 1
+                [[ $OPTARG != +([[:digit:]]) ]] && echo "UNKNOWN - -w must be a non-negative integer" && exit 3
                 WARNING=$OPTARG
                 ;;
         c)
-                [[ $OPTARG != ?(-)+([[:digit:]]) ]] && echo "-c must be a number" && exit 1
+                [[ $OPTARG != +([[:digit:]]) ]] && echo "UNKNOWN - -c must be a non-negative integer" && exit 3
                 CRITICAL=$OPTARG
                 ;;
         b)
                 if [[ "$OPTARG" != "dnf" ]] && [[ "$OPTARG" != "yum" ]]
                 then
-                        echo "-b must be yum or dnf"
-                        exit 1
+                        echo "UNKNOWN - -b must be yum or dnf"
+                        exit 3
                 fi
                 BIN_NAME=$OPTARG
                 ;;                
         h)
                 echo "Usage : -w WARNING -c CRITICAL -b [yum|dnf]"
                 echo "- h help"
+                exit 0
                 ;;      
+        :|\?)
+                echo "UNKNOWN - Invalid option or missing argument: -$OPTARG"
+                exit 3
+                ;;
         esac
 done
 
-PKG2UPDATE=`$BIN_NAME check-update | grep x86_64  | awk -F ' ' '{ print $1 }'  | tr '\r\n' ' '`
-PKG2UPDATENBR=`echo  ${PKG2UPDATE} | wc -w`
+shift "$((OPTIND - 1))"
+if (( $# > 0 || 10#$WARNING > 10#$CRITICAL )); then
+    echo "UNKNOWN - Unexpected arguments or warning threshold above critical"
+    exit 3
+fi
+
+update_status=0
+update_output=$(LC_ALL=C "$BIN_NAME" check-update 2>/dev/null) || update_status=$?
+case $update_status in
+    0) PKG2UPDATENBR=0 ;;
+    100)
+        PKG2UPDATENBR=$(printf '%s\n' "$update_output" | awk '
+            /^Obsoleting Packages/ { exit }
+            /^[^[:space:]]/ && NF == 3 && $1 ~ /\.[[:alnum:]_]+$/ { count++ }
+            END { print count+0 }
+        ')
+        if (( PKG2UPDATENBR == 0 )); then
+            echo "UNKNOWN - $BIN_NAME reported updates but no packages could be parsed"
+            exit 3
+        fi
+        ;;
+    *)
+        echo "UNKNOWN - $BIN_NAME check-update failed (exit $update_status)"
+        exit 3
+        ;;
+esac
 
 perf="|'updates'=$PKG2UPDATENBR;$WARNING;$CRITICAL;;"
 
-if [[ $PKG2UPDATENBR -gt $CRITICAL ]]
+if (( PKG2UPDATENBR > 10#$CRITICAL ))
 then
         echo "$PKG2UPDATENBR $BIN_NAME packages to update $perf "
         exit 2
 else
-        if [[ $PKG2UPDATENBR -gt $WARNING ]]
+        if (( PKG2UPDATENBR > 10#$WARNING ))
         then
                 echo "$PKG2UPDATENBR $BIN_NAME packages to update $perf"
                 exit 1
         else
-                echo " System fully updated $perf"
+                if (( PKG2UPDATENBR == 0 )); then
+                    echo " System fully updated $perf"
+                else
+                    echo "$PKG2UPDATENBR $BIN_NAME packages to update $perf"
+                fi
                 exit 0
         fi
 fi
 
-exit 3

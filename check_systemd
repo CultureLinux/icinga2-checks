@@ -7,39 +7,65 @@
 STATUS_OK=0
 STATUS_WARN=1
 STATUS_CRITICAL=2
+STATUS_UNKNOWN=3
 
 count_ok=0
-count_warn=0
+count_warning=0
 count_critical=0
+count_unknown=0
 
-msg=""
+multi=()
 
-while getopts "s:" opt; do
+while getopts ":s:h" opt; do
     case $opt in
         s) multi+=("$OPTARG")
             ;;
         h) echo " $0 -s ServiceName"
+            exit "$STATUS_OK"
+            ;;
+        :|\?) echo "UNKNOWN - Invalid option or missing argument: -$OPTARG"
+            exit "$STATUS_UNKNOWN"
             ;;
     esac
 done
 shift $((OPTIND -1))
 
+if (( ${#multi[@]} == 0 || $# > 0 )); then
+    echo "UNKNOWN - Usage: $0 -s ServiceName [-s ServiceName ...]"
+    exit "$STATUS_UNKNOWN"
+fi
 
 for service in "${multi[@]}";
 do
 
-    test_started=`systemctl is-active $service` >/dev/null 2>&1
-    test_enabled=`systemctl is-enabled $service` >/dev/null 2>&1
+    test_started=$(systemctl is-active -- "$service" 2>/dev/null)
+    test_enabled=$(systemctl is-enabled -- "$service" 2>/dev/null)
     bitmass=0
 
-    if [[ $test_started == 'inactive' ]]
-    then
-        ((bitmass+=2))
-    fi
-    if [[ $test_enabled == 'disabled' ]]
-    then
-        ((bitmass+=1))
-    fi
+    case $test_started in
+        active|reloading|refreshing) ;;
+        inactive|failed|activating|deactivating|maintenance) ((bitmass+=2)) ;;
+        *)
+            echo "UNKNOWN - Cannot determine active state for $service"
+            ((count_unknown+=1))
+            continue
+            ;;
+    esac
+
+    case $test_enabled in
+        disabled|masked|masked-runtime) ((bitmass+=1)) ;;
+        enabled|enabled-runtime|static|indirect|generated|transient|alias|linked|linked-runtime) ;;
+        *)
+            if [[ $test_started != failed ]]; then
+                echo "UNKNOWN - Cannot determine enablement for $service"
+                ((count_unknown+=1))
+                continue
+            fi
+            echo "CRITICAL - $service failed (enablement unknown)"
+            ((count_critical+=1))
+            continue
+            ;;
+    esac
 
     if [[ $bitmass -eq 3  ]]
     then
@@ -48,7 +74,7 @@ do
     fi
     if [[ $bitmass -eq 2  ]]
     then
-        echo "[$bitmass] !!! $service not active and enable"
+        echo "[$bitmass] !!! $service not active ($test_started), enablement: $test_enabled"
         ((count_critical+=1))
     fi
     if [[ $bitmass -eq 1  ]]
@@ -58,7 +84,7 @@ do
     fi
     if [[ $bitmass -eq 0  ]]
     then
-        echo "[$bitmass] !!! $service active and enable"
+        echo "[$bitmass] !!! $service active, enablement: $test_enabled"
         ((count_ok+=1))
     fi
 done
@@ -66,6 +92,9 @@ done
 if [[ $count_critical -gt 0 ]]
 then
     exit $STATUS_CRITICAL
+elif [[ $count_unknown -gt 0 ]]
+then
+    exit $STATUS_UNKNOWN
 elif [[ $count_warning -gt 0 ]]
 then
     exit $STATUS_WARN

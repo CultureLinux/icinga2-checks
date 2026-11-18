@@ -1,13 +1,18 @@
 #!/bin/bash
 
 # Get the list of upgradable packages
-UPGRADABLE=$(apt list --upgradable 2>/dev/null | grep -v "Listing..." | wc -l)
+if ! apt_output=$(LC_ALL=C apt list --upgradable 2>/dev/null); then
+    printf 'APT UNKNOWN - Unable to list upgradable packages\n'
+    exit 3
+fi
+
+PACKAGE_LIST=$(printf '%s\n' "$apt_output" | awk -F/ '/^[^[:space:]\/]+\/[^[:space:]]+[[:space:]]/ { print $1 }')
+UPGRADABLE=$(printf '%s\n' "$PACKAGE_LIST" | awk 'NF { count++ } END { print count+0 }')
 
 if [ "$UPGRADABLE" -eq 0 ]; then
     echo "APT OK - No packages to upgrade"
     exit 0
 else
-    PACKAGE_LIST=$(apt list --upgradable 2>/dev/null | grep -v "Listing..." | cut -d/ -f1)
-    echo "APT WARNING - $UPGRADABLE packages can be upgraded:\n$PACKAGE_LIST"
+    printf 'APT WARNING - %s packages can be upgraded:\n%s\n' "$UPGRADABLE" "$PACKAGE_LIST"
     exit 1
 fi
