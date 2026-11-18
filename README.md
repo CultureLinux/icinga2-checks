@@ -15,6 +15,21 @@ memory usage from Icinga 2 or the command line.
 | [`check_mem.py`](#check_mempl-and-check_mempy) | Free or used memory on Linux, using `/proc/meminfo`. |
 | [`check_compose_update`](#check_compose_update) | Running Compose images that differ from their declared registry references. |
 
+## Installation
+
+On each host that runs the checks, clone the repository and run the deployment
+script from the checkout.
+
+```bash
+git clone https://github.com/CultureLinux/icinga2-checks.git &&
+  cd icinga2-checks &&
+  sudo ./deploy.sh
+```
+
+The script copies the checks into the existing Nagios plugin directory at
+`/usr/lib/nagios/plugins` on Debian-based systems or
+`/usr/lib64/nagios/plugins` on RHEL- and Fedora-based systems.
+
 ## Usage
 
 Run the command-line examples from the repository root. For the Icinga 2
@@ -263,13 +278,20 @@ persistent caching. Use `--debug` for Docker diagnostics and
 **1. Prepare the Docker host**
 
 From a checkout on the Docker host, copy the plugin into the agent's
-`PluginDir`. The example uses `icinga` and
-`/usr/lib64/nagios/plugins`. Substitute the account and directory configured
-on your agent.
+`PluginDir`. Choose the values matching the agent's account and configured
+`PluginDir`. The scan roots below are examples.
+
+| Host | `check_user` | `plugin_dir` | `scan_root` example |
+| --- | --- | --- | --- |
+| Debian / Raspberry Pi OS | `nagios` | `/usr/lib/nagios/plugins` | `/home/docky/DockerProd` |
+| Rocky Linux | `icinga` | `/usr/lib64/nagios/plugins` | `/home/docky/DockerVault` |
+
+For example, on Rocky Linux:
 
 ```bash
 check_user=icinga
 plugin_dir=/usr/lib64/nagios/plugins
+scan_root=/home/docky/DockerVault
 cache_dir=/tmp/icinga2-compose-update
 
 sudo install -m 0755 check_compose_update "$plugin_dir/check_compose_update"
@@ -289,7 +311,7 @@ sudo usermod -aG docker "$check_user"
 ```
 
 If the scan root is under a private home directory, inspect the permissions on
-each path component with `namei -l /home/docky/docker-prod`. Choose one of the
+each path component with `namei -l "$scan_root"`. Choose one of the
 following options to let the check account traverse `/home/docky`.
 
 **Option A — ACL for the check account.** On a filesystem with ACL support,
@@ -299,12 +321,14 @@ grant the check account traversal through `/home/docky`:
 sudo setfacl -m "u:${check_user}:--x" /home/docky
 ```
 
-**Option B — Use the `docky` group.** Add the check account to the group,
-and grant the group traversal through `/home/docky`. The account also gains access
-to other files and directories already shared with the `docky` group.
+**Option B — Use the `docky` group.** Use this option when `/home/docky`
+belongs to the `docky` group. Add the check account to the group and grant the
+group traversal if needed. The account also gains access to files and
+directories already shared with the `docky` group.
 
 ```bash
 sudo usermod -aG docky "$check_user"
+# Run this only if the docky group lacks execute permission on /home/docky.
 sudo chmod g+x /home/docky
 ```
 
@@ -312,11 +336,14 @@ With either option, the account still needs read and traverse access to the
 directories it scans and read access to the Compose files and their inputs.
 
 After changing group memberships, restart Icinga on the Docker host so the
-agent picks them up. Verify Docker access as the check account.
+agent picks them up. Verify the group memberships, Docker access and scan
+root access as the check account.
 
 ```bash
 sudo systemctl restart icinga2
-sudo -u "$check_user" docker info
+id "$check_user"
+sudo -u "$check_user" -- docker info
+sudo -u "$check_user" -- ls -la "$scan_root"
 ```
 
 **2. Define the check and service**
@@ -360,7 +387,7 @@ The two paths are local to the agent.
 
 ```icinga2
 vars.client_endpoint = "docker.example.org"
-vars.compose_update_root = "/home/docky/docker-prod"
+vars.compose_update_root = "/home/docky/DockerVault" // Use the scan root on this agent.
 vars.compose_update_cache_file = "/tmp/icinga2-compose-update/registry.sqlite3"
 ```
 
@@ -373,7 +400,7 @@ by default.
 
 ```bash
 sudo -u "$check_user" -- "$plugin_dir/check_compose_update" \
-  --root /home/docky/docker-prod \
+  --root "$scan_root" \
   --cache-file "$cache_dir/registry.sqlite3"
 ```
 
