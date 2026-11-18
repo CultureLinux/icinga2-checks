@@ -13,6 +13,7 @@ memory usage from Icinga 2 or the command line.
 | [`check_update`](#check_update) | Pending package upgrades via YUM or DNF, with configurable thresholds. |
 | [`check_mem.pl`](#check_mempl-and-check_mempy) | Free or used memory, with Nagios performance data. |
 | [`check_mem.py`](#check_mempl-and-check_mempy) | Free or used memory on Linux, using `/proc/meminfo`. |
+| [`check_compose_update`](#check_compose_update) | Running Compose images that differ from their declared registry references. |
 
 ## Usage
 
@@ -222,4 +223,122 @@ apply Service for (service_name => config in host.vars.local_plugin_checks) {
 
     assign where host.vars.client_endpoint
 }
+```
+
+## check_compose_update
+
+Scan a directory for Docker Compose projects and compare each running image
+against the declared registry reference for the same platform. The scan stops
+descending once it finds a Compose file in a directory. Use a repeatable
+`--exclude` for directories outside those projects.
+
+The check requires Python 3, Docker Compose, Buildx, and access to the Docker
+Engine and the relevant registries under the account running the check. It
+reads image metadata in place. Services with a build configuration or without
+an active container are skipped.
+
+The default output shows running containers and lists available updates first,
+marked with `!`. Pass `--full` for the full inventory, image digests and cache
+statistics.
+
+```bash
+./check_compose_update --root /home/docky/docker-prod \
+  --cache-file /var/cache/icinga2/compose-update.sqlite3 --cache-ttl 3600
+```
+
+Create the cache's parent directory beforehand and make it writable by the
+account running the check. The SQLite cache stores successful registry digests
+per image reference and platform for one hour by default. Local container
+images are inspected on every run. An expired entry must be refreshed before
+it can be used again. Omit `--cache-file` or set `--cache-ttl 0` to disable
+persistent caching. Use `--debug` for Docker diagnostics and
+`--registry-budget` to set the total registry time budget in seconds.
+
+### Integrate with an Icinga 2 agent
+
+**1. Prepare the Docker host**
+
+From a checkout on the Docker host, copy the plugin into the agent's
+`PluginDir` and prepare its cache directory. The example uses `icinga` and
+`/usr/lib64/nagios/plugins`. Substitute the account and directory configured
+on your agent.
+
+```bash
+check_user=icinga
+plugin_dir=/usr/lib64/nagios/plugins
+cache_dir=/var/cache/icinga2/compose-update
+
+sudo install -m 0755 check_compose_update "$plugin_dir/check_compose_update"
+sudo install -d -m 0750 -o "$check_user" "$cache_dir"
+```
+
+The check account needs to traverse the scan root, read the Compose files and
+their `.env` files, access Docker as configured for the agent, and write to
+the cache directory. Configure any required registry credentials for that same
+account. On a rootful Docker host, membership in the `docker` group grants
+root-level privileges. [Docker Engine access](https://docs.docker.com/engine/install/linux-postinstall/#manage-docker-as-a-non-root-user)
+
+**2. Define the check and service**
+
+Put the `CheckCommand` in a global zone shared by the scheduler and the agent
+(for example, `zones.d/global-templates/commands.conf` if that zone is configured).
+Put the `apply Service` rule in the zone where the Docker host object is
+configured. The `command_endpoint` sends execution to the Docker agent.
+[Icinga 2 distributed monitoring](https://icinga.com/docs/icinga-2/latest/doc/06-distributed-monitoring/)
+
+```icinga2
+object CheckCommand "check_compose_update" {
+    import "plugin-check-command"
+    command = [ PluginDir + "/check_compose_update" ]
+    timeout = 5m
+    arguments = {
+        "--root" = {
+            value = "$compose_update_root$"
+            required = true
+        }
+        "--cache-file" = "$compose_update_cache_file$"
+        "--cache-ttl" = "$compose_update_cache_ttl$"
+    }
+    vars.compose_update_cache_ttl = 3600
+}
+```
+
+```icinga2
+apply Service "compose-image-updates" {
+    import "generic-service"
+    check_command = "check_compose_update"
+    command_endpoint = host.vars.client_endpoint
+    check_interval = 30m
+    assign where host.vars.client_endpoint && host.vars.compose_update_root
+}
+```
+
+Add these variables to the existing Docker host object. Set
+`client_endpoint` to the exact name of the agent's Icinga `Endpoint`.
+The two paths are local to the agent.
+
+```icinga2
+vars.client_endpoint = "docker.example.org"
+vars.compose_update_root = "/home/docky/docker-prod"
+vars.compose_update_cache_file = "/var/cache/icinga2/compose-update/registry.sqlite3"
+```
+
+**3. Validate the integration**
+
+On the Docker host, run the installed plugin twice as the check account. The
+second run should report cache hits for successful registry lookups from the
+first run. The Icinga service uses the shorter output by default.
+
+```bash
+sudo -u "$check_user" -- "$plugin_dir/check_compose_update" \
+  --root /home/docky/docker-prod \
+  --cache-file "$cache_dir/registry.sqlite3" --full
+```
+
+Validate the Icinga configuration before reloading it on the scheduler.
+After the first scheduled check, confirm the service result and the update
+lines in Icinga Web.
+
+```bash
+sudo icinga2 daemon -C
 ```
