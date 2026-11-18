@@ -2,12 +2,17 @@
 
 WARNING=27
 CRITICAL=10
-
 if [[ $1 != '' && $2 != ''  ]]
 then
-  now_epoch=$( date +%s )
-  totest=`echo | openssl s_client -showcerts -servername $1 -connect "$1:$2" 2>/dev/null | openssl x509 -inform pem -noout -enddate | cut -d "=" -f 2 `
-  day_diff=$(( ($(date --date="$totest" +%s) - $now_epoch )/(60*60*24) ))
+  if ! tls_output=$(timeout -k 1s 10s openssl s_client -servername "$1" -connect "$1:$2" </dev/null 2>/dev/null) ||
+      ! not_after=$(openssl x509 -inform pem -noout -enddate <<< "$tls_output" 2>/dev/null) ||
+      [[ $not_after != notAfter=?* ]] ||
+      ! expiry_epoch=$(LC_ALL=C date --date="${not_after#notAfter=}" +%s 2>/dev/null) ||
+      ! now_epoch=$(date +%s); then
+    printf 'UNKNOWN - Impossible de lire la date d’expiration pour %s:%s\n' "$1" "$2"
+    exit 3
+  fi
+  day_diff=$(( (expiry_epoch - now_epoch)/(60*60*24) ))
   if [[ $day_diff -gt $WARNING ]]
   then
      echo "$day_diff jours restant pour $1:$2"
@@ -16,15 +21,11 @@ then
   then
     echo "$day_diff jours restant pour $1:$2"
     exit 1
-  elif [[  $day_diff -le $CRITICAL ]]
-  then
+  else
     echo "$day_diff jours restant pour $1:$2"
     exit 2
-  else 
-    echo "Erreur pour $1:$2"
-    exit 3
   fi
 else
-  echo 'usage ./check_openssl_certificate.sh <hostname> <port>'
+  echo "usage: $0 <hostname> <port>"
   exit 3
 fi

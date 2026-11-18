@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 
 import argparse
-import os
 import sys
+from typing import NoReturn, Tuple
 
 # Heavily based on the script from:
 # check_mem.pl Copyright (C) 2000 Dan Larsson <dl@tyfon.net>
@@ -25,7 +25,7 @@ exit_codes = {
 }
 
 # Initialisation des options d'arguments
-def init():
+def init() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Nagios Plugin - Check Memory')
     parser.add_argument('-c', type=int, required=True, help='Niveau critique en pourcentage')
     parser.add_argument('-f', action='store_true', help='Vérifie la mémoire libre')
@@ -46,31 +46,37 @@ def init():
     return args
 
 # Récupère les informations de mémoire du système
-def get_memory_info():
-    total_memory_kb = free_memory_kb = used_memory_kb = caches_kb = hugepages_kb = 0
+def get_memory_info() -> Tuple[int, int, int, int]:
+    """Lit les compteurs nécessaires dans /proc/meminfo."""
+    if sys.platform != 'linux':
+        raise ValueError("ce check est limité à Linux")
 
-    # Vérifie si le système est sous Linux
-    if sys.platform == 'linux':
-        with open('/proc/meminfo') as f:
-            for line in f:
-                if 'MemTotal' in line:
-                    total_memory_kb = int(line.split()[1])
-                elif 'MemFree' in line:
-                    free_memory_kb = int(line.split()[1])
-                elif 'Buffers' in line or 'Cached' in line or 'SReclaimable' in line:
-                    caches_kb += int(line.split()[1])
-                elif 'HugePages_Total' in line:
-                    hugepages_kb += int(line.split()[1]) * int(line.split()[1])
+    fields = {
+        'MemTotal', 'MemFree', 'Buffers', 'Cached', 'SReclaimable',
+        'Shmem', 'HugePages_Total', 'Hugepagesize',
+    }
+    values = {}
+    with open('/proc/meminfo') as f:
+        for line in f:
+            name, _, value = line.partition(':')
+            if name in fields:
+                values[name] = int(value.split(maxsplit=1)[0])
 
-        used_memory_kb = total_memory_kb - free_memory_kb
+    total_memory_kb = values['MemTotal']
+    free_memory_kb = values['MemFree']
+    used_memory_kb = total_memory_kb - free_memory_kb
+    caches_kb = sum(values.get(name, 0) for name in ('Buffers', 'Cached', 'SReclaimable'))
+    caches_kb -= values.get('Shmem', 0)
+    hugepages_count = values.get('HugePages_Total', 0)
+    hugepages_kb = hugepages_count * values['Hugepagesize'] if hugepages_count else 0
 
     return free_memory_kb, used_memory_kb, caches_kb, hugepages_kb
 
 # Afficher les informations à Nagios
-def tell_nagios(used_memory, free_memory, caches, hugepages, args):
+def tell_nagios(used_memory: int, free_memory: int, args: argparse.Namespace) -> None:
     total_memory = used_memory + free_memory
-    perf_warn = int(total_memory * (args.w / 100))
-    perf_crit = int(total_memory * (args.c / 100))
+    if total_memory <= 0 or min(used_memory, free_memory) < 0:
+        finish("UNKNOWN - Compteurs mémoire incohérents", exit_codes['UNKNOWN'])
 
     if args.f:
         free_percent = free_memory / total_memory * 100
@@ -90,14 +96,24 @@ def tell_nagios(used_memory, free_memory, caches, hugepages, args):
             finish(f"OK - {used_percent:.1f}% ({used_memory} kB) utilisé", exit_codes['OK'])
 
 # Afficher le message et quitter
-def finish(msg, state):
+def finish(msg: str, state: int) -> NoReturn:
     print(msg)
     sys.exit(state)
 
 # Exécution du script
 if __name__ == "__main__":
     args = init()
-    free_memory_kb, used_memory_kb, caches_kb, hugepages_kb = get_memory_info()
+    try:
+        free_memory_kb, used_memory_kb, caches_kb, hugepages_kb = get_memory_info()
+    except (OSError, KeyError, ValueError, IndexError) as exc:
+        finish(f"UNKNOWN - Lecture des compteurs mémoire impossible ({exc})", exit_codes['UNKNOWN'])
+
+    if args.v:
+        print(
+            f"MemFree={free_memory_kb} kB MemUsed={used_memory_kb} kB "
+            f"Caches={caches_kb} kB HugePages={hugepages_kb} kB",
+            file=sys.stderr,
+        )
 
     if args.C:
         used_memory_kb -= caches_kb
@@ -105,5 +121,5 @@ if __name__ == "__main__":
     if args.H:
         used_memory_kb -= hugepages_kb
 
-    tell_nagios(used_memory_kb, free_memory_kb, caches_kb, hugepages_kb, args)
+    tell_nagios(used_memory_kb, free_memory_kb, args)
 

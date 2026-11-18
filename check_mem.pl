@@ -73,6 +73,9 @@ sub tell_nagios {
     # Calculate Total Memory
     my $total = $free + $used;
     print "$total Total\n" if ($opt_v);
+    if ($total <= 0 || $free < 0 || $used < 0) {
+        finish("UNKNOWN - Invalid memory counters", $exit_codes{'UNKNOWN'});
+    }
 
     my $perf_warn;
     my $perf_crit;
@@ -88,11 +91,11 @@ sub tell_nagios {
     $perfdata .= " HUGEPAGES=${hugepages}KB;;;;" if ($opt_h);
 
     if ($opt_f) {
-      my $percent    = sprintf "%.1f", ($free / $total * 100);
-      if ($percent <= $opt_c) {
+      my $percent = sprintf "%.1f", ($free / $total * 100);
+      if ($free * 100 <= $opt_c * $total) {
           finish("CRITICAL - $percent% ($free kB) free!$perfdata",$exit_codes{'CRITICAL'});
       }
-      elsif ($percent <= $opt_w) {
+      elsif ($free * 100 <= $opt_w * $total) {
           finish("WARNING - $percent% ($free kB) free!$perfdata",$exit_codes{'WARNING'});
       }
       else {
@@ -100,11 +103,11 @@ sub tell_nagios {
       }
     }
     elsif ($opt_u) {
-      my $percent    = sprintf "%.1f", ($used / $total * 100);
-      if ($percent >= $opt_c) {
+      my $percent = sprintf "%.1f", ($used / $total * 100);
+      if ($used * 100 >= $opt_c * $total) {
           finish("CRITICAL - $percent% ($used kB) used!$perfdata",$exit_codes{'CRITICAL'});
       }
-      elsif ($percent >= $opt_w) {
+      elsif ($used * 100 >= $opt_w * $total) {
           finish("WARNING - $percent% ($used kB) used!$perfdata",$exit_codes{'WARNING'});
       }
       else {
